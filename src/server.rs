@@ -64,17 +64,21 @@ async fn ws_handler(
 async fn handle_ws(socket: WebSocket, state: AppState, query: WsQuery) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
+    let token = query.token.unwrap_or_default();
     let cols = query.cols.unwrap_or(80);
     let rows = query.rows.unwrap_or(24);
 
+    let token_short: String = token.chars().take(4).collect();
+
     let result = state
         .pty_manager
-        .create_session(cols, rows, query.shell)
+        .get_or_create_session(&token, cols, rows, query.shell)
         .await;
 
-    let (session_id, output_tx) = match result {
+    let (output_tx, existed) = match result {
         Ok(v) => v,
         Err(e) => {
+            tracing::error!(token = %token_short, "Failed to create session: {e}");
             let _ = ws_sender
                 .send(Message::Text(format!("Error: {e}").into()))
                 .await;
@@ -82,10 +86,16 @@ async fn handle_ws(socket: WebSocket, state: AppState, query: WsQuery) {
         }
     };
 
+    if existed {
+        tracing::info!(token = %token_short, cols, rows, "Client reconnected to existing session");
+        let _ = state.pty_manager.resize_session(&token, cols, rows).await;
+    } else {
+        tracing::info!(token = %token_short, cols, rows, "New client connected, session created");
+    }
+
     let mut output_rx = output_tx.subscribe();
 
-    let id_for_task = session_id.clone();
-    let pty = state.pty_manager.clone();
+    let token_for_read = token.clone();
     let read_task = tokio::spawn(async move {
         while let Ok(data) = output_rx.recv().await {
             let msg = Message::Binary(data.into());
@@ -93,16 +103,16 @@ async fn handle_ws(socket: WebSocket, state: AppState, query: WsQuery) {
                 break;
             }
         }
-        let _ = pty.kill_session(&id_for_task).await;
+        drop(token_for_read);
     });
 
-    let id_for_write = session_id.clone();
-    let pty_for_write = state.pty_manager.clone();
+    let token_for_write = token.clone();
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Binary(data) => {
-                if pty_for_write
-                    .write_to_session(&id_for_write, &data)
+                if state
+                    .pty_manager
+                    .write_to_session(&token_for_write, &data)
                     .await
                     .is_err()
                 {
@@ -111,13 +121,15 @@ async fn handle_ws(socket: WebSocket, state: AppState, query: WsQuery) {
             }
             Message::Text(text) => {
                 if let Ok(resize) = serde_json::from_str::<ResizePayload>(&text) {
-                    let _ = pty_for_write
-                        .resize_session(&id_for_write, resize.cols, resize.rows)
+                    let _ = state
+                        .pty_manager
+                        .resize_session(&token_for_write, resize.cols, resize.rows)
                         .await;
                 } else {
                     let data = text.as_bytes();
-                    if pty_for_write
-                        .write_to_session(&id_for_write, data)
+                    if state
+                        .pty_manager
+                        .write_to_session(&token_for_write, data)
                         .await
                         .is_err()
                     {
@@ -131,5 +143,5 @@ async fn handle_ws(socket: WebSocket, state: AppState, query: WsQuery) {
     }
 
     read_task.abort();
-    let _ = state.pty_manager.kill_session(&session_id).await;
+    tracing::info!(token = %token_short, "Client disconnected");
 }

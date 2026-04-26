@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -10,26 +11,48 @@ struct PtySession {
     writer: Box<dyn Write + Send>,
     #[allow(dead_code)]
     output_tx: broadcast::Sender<Vec<u8>>,
-    id: String,
 }
 
 pub struct PtyManager {
-    sessions: Arc<Mutex<Vec<Arc<Mutex<PtySession>>>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<PtySession>>>>>,
 }
 
 impl PtyManager {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(Vec::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn create_session(
+    pub async fn get_or_create_session(
         &self,
+        token: &str,
         cols: u16,
         rows: u16,
         shell: Option<String>,
-    ) -> Result<(String, broadcast::Sender<Vec<u8>>)> {
+    ) -> Result<(broadcast::Sender<Vec<u8>>, bool)> {
+        let mut sessions = self.sessions.lock().await;
+
+        if let Some(session) = sessions.get(token) {
+            let s = session.lock().await;
+            return Ok((s.output_tx.clone(), true));
+        }
+
+        let session = Self::create_pty_session(cols, rows, shell)?;
+        let tx = {
+            let s = session.lock().await;
+            s.output_tx.clone()
+        };
+        sessions.insert(token.to_string(), session);
+
+        Ok((tx, false))
+    }
+
+    fn create_pty_session(
+        cols: u16,
+        rows: u16,
+        shell: Option<String>,
+    ) -> Result<Arc<Mutex<PtySession>>> {
         let pty_system = native_pty_system();
 
         let pair = pty_system
@@ -59,76 +82,45 @@ impl PtyManager {
             .take_writer()
             .context("Failed to get PTY writer")?;
 
-        let id = uuid::Uuid::new_v4().to_string();
         let (output_tx, _) = broadcast::channel(4096);
 
         let session = PtySession {
             master: pair.master,
             writer,
             output_tx: output_tx.clone(),
-            id: id.clone(),
         };
-
-        let session = Arc::new(Mutex::new(session));
-
-        {
-            let mut sessions = self.sessions.lock().await;
-            sessions.push(session.clone());
-        }
 
         spawn_reader(reader, output_tx.clone());
 
-        Ok((id, output_tx))
+        Ok(Arc::new(Mutex::new(session)))
     }
 
-    pub async fn write_to_session(&self, id: &str, data: &[u8]) -> Result<()> {
+    pub async fn write_to_session(&self, token: &str, data: &[u8]) -> Result<()> {
         let sessions = self.sessions.lock().await;
-        for session in sessions.iter() {
-            let mut s = session.lock().await;
-            if s.id == id {
-                s.writer.write_all(data)?;
-                s.writer.flush()?;
-                return Ok(());
-            }
-        }
-        anyhow::bail!("Session {} not found", id)
+        let session = sessions
+            .get(token)
+            .context(format!("Session for token {} not found", &token[..4]))?;
+        let mut s = session.lock().await;
+        s.writer.write_all(data)?;
+        s.writer.flush()?;
+        Ok(())
     }
 
-    pub async fn resize_session(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
+    pub async fn resize_session(&self, token: &str, cols: u16, rows: u16) -> Result<()> {
         let sessions = self.sessions.lock().await;
-        for session in sessions.iter() {
-            let s = session.lock().await;
-            if s.id == id {
-                s.master
-                    .resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("Failed to resize PTY")?;
-                return Ok(());
-            }
-        }
-        anyhow::bail!("Session {} not found", id)
-    }
-
-    pub async fn kill_session(&self, id: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        let mut found_idx = None;
-        for (i, session) in sessions.iter().enumerate() {
-            let s = session.lock().await;
-            if s.id == id {
-                found_idx = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = found_idx {
-            sessions.remove(i);
-            Ok(())
-        } else {
-            anyhow::bail!("Session {} not found", id)
-        }
+        let session = sessions
+            .get(token)
+            .context(format!("Session for token {} not found", &token[..4]))?;
+        let s = session.lock().await;
+        s.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("Failed to resize PTY")?;
+        Ok(())
     }
 }
 
