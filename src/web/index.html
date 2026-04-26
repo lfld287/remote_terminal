@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Remote Terminal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #1a1a2e; }
+  #terminal { height: calc(100% - 44px); }
+  #toolbar {
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 0 4px;
+    background: #16213e;
+    border-top: 1px solid #0f3460;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  #toolbar button {
+    min-width: 40px;
+    height: 34px;
+    border: none;
+    border-radius: 6px;
+    background: #0f3460;
+    color: #e0e0e0;
+    font-size: 13px;
+    font-family: -apple-system, sans-serif;
+    padding: 0 10px;
+    cursor: pointer;
+    flex-shrink: 0;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  #toolbar button:active { background: #533483; }
+  #toolbar button.active { background: #e94560; color: #fff; }
+  #status {
+    position: fixed; top: 0; left: 0; right: 0;
+    text-align: center; padding: 4px;
+    font-size: 12px; color: #aaa;
+    font-family: -apple-system, sans-serif;
+    pointer-events: none; z-index: 100;
+    transition: opacity 0.5s;
+  }
+</style>
+</head>
+<body>
+<div id="status">Connecting...</div>
+<div id="terminal"></div>
+<div id="toolbar">
+  <button id="btn-ctrl">Ctrl</button>
+  <button id="btn-alt">Alt</button>
+  <button id="btn-esc">Esc</button>
+  <button id="btn-tab">Tab</button>
+  <button id="btn-up">▲</button>
+  <button id="btn-down">▼</button>
+  <button id="btn-left">◄</button>
+  <button id="btn-right">►</button>
+  <button id="btn-cc">Ctrl+C</button>
+  <button id="btn-cd">Ctrl+D</button>
+  <button id="btn-cl">Ctrl+L</button>
+  <button id="btn-cr">Enter</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script>
+(function() {
+  const params = new URLSearchParams(location.search);
+  const token = params.get('token') || '';
+
+  const term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+    theme: {
+      background: '#1a1a2e',
+      foreground: '#e0e0e0',
+      cursor: '#e94560',
+      selectionBackground: '#533483',
+    },
+    scrollback: 5000,
+  });
+
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal'));
+  fitAddon.fit();
+
+  const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:')
+    + '//' + location.host + '/ws?token=' + encodeURIComponent(token)
+    + '&cols=' + term.cols + '&rows=' + term.rows;
+
+  let ws = null;
+  let connected = false;
+
+  function connect() {
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = function() {
+      connected = true;
+      document.getElementById('status').style.opacity = '0';
+      term.focus();
+    };
+
+    ws.onmessage = function(e) {
+      if (e.data instanceof ArrayBuffer) {
+        term.write(new Uint8Array(e.data));
+      } else {
+        term.write(e.data);
+      }
+    };
+
+    ws.onclose = function() {
+      connected = false;
+      document.getElementById('status').textContent = 'Disconnected - reconnecting...';
+      document.getElementById('status').style.opacity = '1';
+      setTimeout(connect, 2000);
+    };
+
+    ws.onerror = function() {
+      ws.close();
+    };
+  }
+
+  connect();
+
+  term.onData(function(data) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const encoder = new TextEncoder();
+      ws.send(encoder.encode(data));
+    }
+  });
+
+  function sendText(text) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const encoder = new TextEncoder();
+      ws.send(encoder.encode(text));
+    }
+  }
+
+  function sendResize() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ cols: term.cols, rows: term.rows }));
+    }
+  }
+
+  window.addEventListener('resize', function() {
+    fitAddon.fit();
+    sendResize();
+  });
+
+  // Modifier key state
+  let ctrlActive = false;
+  let altActive = false;
+
+  const btnCtrl = document.getElementById('btn-ctrl');
+  const btnAlt = document.getElementById('btn-alt');
+
+  btnCtrl.addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    ctrlActive = !ctrlActive;
+    btnCtrl.classList.toggle('active', ctrlActive);
+  });
+
+  btnAlt.addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    altActive = !altActive;
+    btnAlt.classList.toggle('active', altActive);
+  });
+
+  // Helper to send with modifiers
+  function sendCtrlChar(ch) {
+    var code = ch.toLowerCase().charCodeAt(0) - 96;
+    if (code >= 1 && code <= 26) {
+      sendText(String.fromCharCode(code));
+    }
+  }
+
+  function sendKey(key) {
+    if (ctrlActive) {
+      sendCtrlChar(key);
+      ctrlActive = false;
+      btnCtrl.classList.remove('active');
+    } else if (altActive) {
+      sendText('\x1b' + key);
+      altActive = false;
+      btnAlt.classList.remove('active');
+    } else {
+      sendText(key);
+    }
+  }
+
+  document.getElementById('btn-esc').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x1b'); });
+  document.getElementById('btn-tab').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\t'); });
+  document.getElementById('btn-up').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x1b[A'); });
+  document.getElementById('btn-down').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x1b[B'); });
+  document.getElementById('btn-left').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x1b[D'); });
+  document.getElementById('btn-right').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x1b[C'); });
+  document.getElementById('btn-cc').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x03'); });
+  document.getElementById('btn-cd').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x04'); });
+  document.getElementById('btn-cl').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\x0c'); });
+  document.getElementById('btn-cr').addEventListener('touchstart', function(e) { e.preventDefault(); sendText('\r'); });
+
+  // Prevent default touch behaviors on toolbar
+  document.getElementById('toolbar').addEventListener('touchmove', function(e) {
+    e.preventDefault();
+  }, { passive: false });
+})();
+</script>
+</body>
+</html>
